@@ -10,6 +10,24 @@ const app = express();
 const PORT = 3000;
 const server = http.createServer(app);
 
+// Enable CORS for all requests to support external P2P hosts (e.g. Vercel)
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+  next();
+});
+
+// REST API for fetching Gemini clues to support client-side/P2P hosting
+app.get('/api/gemini-clues', async (req, res) => {
+  const category = (req.query.category as string) || '과일';
+  try {
+    const clues = await generateGameClues(category);
+    res.json(clues);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to generate clues' });
+  }
+});
+
 // In-memory data store for rooms and socket associations
 const rooms: Record<string, GameRoom> = {};
 const clientSockets = new Map<string, WebSocket>();

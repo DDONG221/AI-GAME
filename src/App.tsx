@@ -4,6 +4,7 @@ import HostView from './components/HostView.js';
 import PlayerView from './components/PlayerView.js';
 import { motion, AnimatePresence } from 'motion/react';
 import { Crown, Users, ArrowRight, RefreshCw, AlertTriangle, HelpCircle, Gamepad2 } from 'lucide-react';
+import { Peer } from 'peerjs';
 
 function getOrCreatePlayerId(): string {
   let pid = localStorage.getItem('ai_catch_tail_player_id');
@@ -14,6 +15,56 @@ function getOrCreatePlayerId(): string {
   return pid;
 }
 
+const AVATAR_EMOJIS = ['🦊', '🐰', '🦁', '🦉', '🐹', '🐼', '🐨', '🐸', '🐙', '🦖', '🦄', '🐝'];
+const AVATAR_COLORS = [
+  '#ef4444', // Red
+  '#f97316', // Orange
+  '#f59e0b', // Amber
+  '#10b981', // Emerald
+  '#06b6d4', // Cyan
+  '#3b82f6', // Blue
+  '#6366f1', // Indigo
+  '#8b5cf6', // Violet
+  '#ec4899'  // Pink
+];
+
+// Helper to filter state to prevent client-side peeking/cheating (WebRTC security/fair-play)
+function getFilteredRoomState(room: GameRoom, clientId: string, isClientHost: boolean): any {
+  const filteredPlayers = room.players.map(p => {
+    const isSelf = p.id === clientId;
+    const revealAll = room.phase === 'RESULT' || room.phase === 'VOTE_REVEAL' || room.phase === 'LIAR_GUESS';
+    
+    return {
+      id: p.id,
+      nickName: p.nickName,
+      avatarColor: p.avatarColor,
+      avatarEmoji: p.avatarEmoji,
+      isConnected: p.isConnected,
+      points: p.points,
+      isHost: p.isHost,
+      role: (isSelf || isClientHost || revealAll) ? p.role : 'PENDING',
+      word: (isSelf || room.phase === 'RESULT') ? p.word : '',
+      submission: (room.phase === 'REVEAL' || room.phase === 'VOTING' || revealAll || isSelf) ? p.submission : '',
+      votedFor: (room.phase === 'VOTE_REVEAL' || room.phase === 'RESULT' || isSelf) ? p.votedFor : null
+    };
+  });
+
+  return {
+    roomCode: room.roomCode,
+    category: room.category,
+    customCategory: room.customCategory,
+    aiPrompt: room.aiPrompt,
+    phase: room.phase,
+    players: filteredPlayers,
+    liarMode: room.liarMode,
+    citizenWord: (room.phase === 'RESULT' || room.phase === 'LIAR_GUESS') ? room.citizenWord : '',
+    liarWord: (room.phase === 'RESULT' || room.phase === 'LIAR_GUESS') ? room.liarWord : '',
+    decoys: (room.phase === 'LIAR_GUESS' || room.phase === 'RESULT') ? room.decoys : [],
+    winner: room.winner,
+    roundCount: room.roundCount
+  };
+}
+
 export default function App() {
   const playerId = getOrCreatePlayerId();
   const [viewMode, setViewMode] = useState<'landing' | 'host' | 'player'>('landing');
@@ -22,200 +73,516 @@ export default function App() {
   const [room, setRoom] = useState<GameRoom | null>(null);
   const [errorMsg, setErrorMsg] = useState('');
   const [wsStatus, setWsStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
-  const [activeWsUrl, setActiveWsUrl] = useState<string>('');
   const [connectionMessage, setConnectionMessage] = useState<string>('');
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const wsAttemptIndexRef = useRef<number>(0);
-  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const connectionDetailsRef = useRef<{ roomCode: string; isHost: boolean; nickName: string } | null>(null);
+  // WebRTC Peer References
+  const peerRef = useRef<Peer | null>(null);
+  const playerConnectionsRef = useRef<Record<string, any>>({});
+  const hostConnRef = useRef<any>(null);
 
-  // Initialize and connect WebSocket with smart automatic fallback reconnection loop
-  const connectWebSocket = (code: string, isHost: boolean, name: string, forceUrl?: string) => {
-    if (wsRef.current) {
-      try {
-        wsRef.current.close();
-      } catch (_) {}
+  // Broadcast function to update players
+  const broadcastToPlayers = (currentRoom: GameRoom) => {
+    if (!currentRoom) return;
+    Object.keys(playerConnectionsRef.current).forEach((pId) => {
+      const conn = playerConnectionsRef.current[pId];
+      if (conn && conn.open) {
+        const filteredState = getFilteredRoomState(currentRoom, pId, false);
+        conn.send({
+          type: 'STATE_UPDATE',
+          payload: filteredState
+        });
+      }
+    });
+  };
+
+  // Host state update state-machine, matches server.ts backend logic
+  const hostProcessAction = (type: string, payload: any, senderConn?: any) => {
+    setRoom((prevRoom) => {
+      if (!prevRoom) return null;
+      const room = JSON.parse(JSON.stringify(prevRoom)) as GameRoom;
+
+      switch (type) {
+        case 'JOIN_SESSION': {
+          const { playerId: pId, nickName, isHost } = payload;
+          
+          if (isHost) {
+            let hostPlayer = room.players.find(p => p.isHost);
+            if (!hostPlayer) {
+              room.players.push({
+                id: pId,
+                nickName: nickName || 'Host',
+                avatarColor: '#1e293b',
+                avatarEmoji: '👑',
+                role: 'PENDING',
+                word: '',
+                submission: '',
+                votedFor: null,
+                points: 0,
+                isHost: true,
+                isConnected: true
+              });
+            } else {
+              hostPlayer.isConnected = true;
+            }
+          } else {
+            // Check for nickname collision
+            if (room.players.some(p => !p.isHost && p.nickName === nickName && p.id !== pId)) {
+              if (senderConn) {
+                senderConn.send({
+                  type: 'JOIN_ERROR',
+                  payload: { message: '이미 방에 사용 중인 닉네임입니다. 다른 닉네임을 써주세요.' }
+                });
+              }
+              return prevRoom;
+            }
+
+            let player = room.players.find(p => p.id === pId);
+            if (!player) {
+              const avatarEmoji = AVATAR_EMOJIS[room.players.length % AVATAR_EMOJIS.length];
+              const avatarColor = AVATAR_COLORS[room.players.length % AVATAR_COLORS.length];
+
+              player = {
+                id: pId,
+                nickName,
+                avatarColor,
+                avatarEmoji,
+                role: 'PENDING',
+                word: '',
+                submission: '',
+                votedFor: null,
+                points: 0,
+                isHost: false,
+                isConnected: true
+              };
+              room.players.push(player);
+            } else {
+              player.isConnected = true;
+              if (nickName) player.nickName = nickName;
+            }
+          }
+
+          if (senderConn) {
+            playerConnectionsRef.current[pId] = senderConn;
+          }
+          break;
+        }
+
+        case 'UPDATE_GAME_SETS': {
+          const { category, customCategory, liarMode } = payload;
+          room.category = category;
+          room.customCategory = customCategory || '';
+          room.liarMode = liarMode || 'RELATED_WORD';
+          break;
+        }
+
+        case 'PROCEED_PHASE': {
+          room.phase = payload.targetPhase;
+          break;
+        }
+
+        case 'SUBMIT_ANSWER': {
+          const { playerId: pId, answer } = payload;
+          const player = room.players.find(p => p.id === pId);
+          if (player) {
+            player.submission = answer || '';
+          }
+
+          const activePlayers = room.players.filter(p => !p.isHost && p.isConnected);
+          const allSubmitted = activePlayers.every(p => p.submission.trim().length > 0);
+          if (allSubmitted) {
+            room.phase = 'REVEAL';
+          }
+          break;
+        }
+
+        case 'VOTE_PLAYER': {
+          const { voterId, targetId } = payload;
+          const voter = room.players.find(p => p.id === voterId);
+          if (voter) {
+            voter.votedFor = targetId;
+          }
+
+          const activePlayers = room.players.filter(p => !p.isHost && p.isConnected);
+          const allVoted = activePlayers.every(p => p.votedFor !== null);
+          if (allVoted) {
+            room.phase = 'VOTE_REVEAL';
+          }
+          break;
+        }
+
+        case 'REVEAL_VOTES_AND_CHECK': {
+          const activePlayers = room.players.filter(p => !p.isHost && p.isConnected);
+          const votes: Record<string, number> = {};
+          activePlayers.forEach(p => {
+            if (p.votedFor) {
+              votes[p.votedFor] = (votes[p.votedFor] || 0) + 1;
+            }
+          });
+
+          let highestVoteCount = 0;
+          let highestVotedIds: string[] = [];
+          for (const [votedId, count] of Object.entries(votes)) {
+            if (count > highestVoteCount) {
+              highestVoteCount = count;
+              highestVotedIds = [votedId];
+            } else if (count === highestVoteCount) {
+              highestVotedIds.push(votedId);
+            }
+          }
+
+          const liar = room.players.find(p => p.role === 'LIAR');
+          if (liar && highestVotedIds.includes(liar.id)) {
+            room.phase = 'LIAR_GUESS';
+          } else {
+            room.winner = 'LIAR';
+            room.players.forEach(p => {
+              if (p.role === 'LIAR') p.points += 3;
+            });
+            room.phase = 'RESULT';
+          }
+          break;
+        }
+
+        case 'SUBMIT_LIAR_GUESS': {
+          const { guess } = payload;
+          const isLiarCorrect = guess?.trim() === room.citizenWord?.trim();
+          if (isLiarCorrect) {
+            room.winner = 'LIAR';
+            room.players.forEach(p => {
+              if (p.role === 'LIAR') p.points += 3;
+            });
+          } else {
+            room.winner = 'CITIZENS';
+            room.players.forEach(p => {
+              if (p.role === 'CITIZEN') p.points += 2;
+            });
+          }
+          room.phase = 'RESULT';
+          break;
+        }
+
+        case 'RESTART_TO_LOBBY': {
+          room.phase = 'LOBBY';
+          room.citizenWord = '';
+          room.liarWord = '';
+          room.aiPrompt = '대기 중입니다...';
+          room.winner = null;
+          room.decoys = [];
+          room.players.forEach(p => {
+            p.role = 'PENDING';
+            p.word = '';
+            p.submission = '';
+            p.votedFor = null;
+          });
+          break;
+        }
+
+        case 'REMOVE_PLAYER': {
+          const { playerIdToRemove } = payload;
+          const idx = room.players.findIndex(p => p.id === playerIdToRemove);
+          if (idx !== -1) {
+            room.players.splice(idx, 1);
+          }
+          const conn = playerConnectionsRef.current[playerIdToRemove];
+          if (conn) {
+            conn.send({
+              type: 'JOIN_ERROR',
+              payload: { message: '방장에 의해 강퇴되었습니다.' }
+            });
+            try { conn.close(); } catch (_) {}
+            delete playerConnectionsRef.current[playerIdToRemove];
+          }
+          break;
+        }
+      }
+
+      setTimeout(() => {
+        broadcastToPlayers(room);
+      }, 0);
+
+      return room;
+    });
+  };
+
+  // Host startup sequence (Async fetch to trigger Cloud Run proxy or Client fallbacks)
+  const hostStartGameAsync = async (category: string, customCategory: string, liarMode: 'RELATED_WORD' | 'NO_WORD') => {
+    setRoom((prev) => {
+      if (!prev) return null;
+      const next = JSON.parse(JSON.stringify(prev)) as GameRoom;
+      next.phase = 'ROLE_RESET';
+      setTimeout(() => broadcastToPlayers(next), 0);
+      return next;
+    });
+
+    const finalCategory = customCategory?.trim() ? customCategory.trim() : category;
+
+    let clues: any;
+    try {
+      const targetUrl = `https://ais-pre-f73mcmuyldhv26doe2k27r-254952566287.asia-northeast1.run.app/api/gemini-clues?category=${encodeURIComponent(finalCategory)}`;
+      console.log('[Clues Fetch] Requesting:', targetUrl);
+      const res = await fetch(targetUrl);
+      if (!res.ok) throw new Error('API request failed');
+      clues = await res.json();
+    } catch (err) {
+      console.warn('[Clues Fetch] Failed to fetch clues, using rich local fallbacks:', err);
+      const fallbacks: any = {
+        '과일': [
+          { citizenWord: "사과", liarWord: "배", aiPrompt: "이 과일의 첫 느낌을 다섯 글자로 찬양해 본다면?", decoys: ["복숭아", "바나나"] },
+          { citizenWord: "바나나", liarWord: "파인애플", aiPrompt: "이 노란 매력을 무인도에 고립된 내 지인에게 비유해 주세요.", decoys: ["망고", "오렌지"] }
+        ],
+        '동물': [
+          { citizenWord: "호랑이", liarWord: "사자", aiPrompt: "이 동물이 만약 직장 상사라면 부하 직원들에게 가장 자주 던질 잔소리는?", decoys: ["치타", "표범"] },
+          { citizenWord: "고양이", liarWord: "강아지", aiPrompt: "이 생물이 인간 세계에서 커피숍을 열었을 때 출시할 기상천외한 메뉴 이름은?", decoys: ["토끼", "햄스터"] }
+        ],
+        '음식': [
+          { citizenWord: "떡볶이", liarWord: "라면", aiPrompt: "이 음식을 일요일 오후 세 시에 혼자 티비를 보면서 한 숟가락 입에 넣었을 때 떠오르는 상상은?", decoys: ["김밥", "순대"] }
+        ]
+      };
+      const catFallbacks = fallbacks[category] || [
+        { citizenWord: "우주비행사", liarWord: "비행기조종사", aiPrompt: "이 사람들이 출근길 외투 주머니에 절대 빠뜨리지 않는 가장 의외의 물건은?", decoys: ["소방관", "경찰관"] }
+      ];
+      clues = catFallbacks[Math.floor(Math.random() * catFallbacks.length)];
     }
 
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current);
-    }
+    setRoom((prev) => {
+      if (!prev) return null;
+      const room = JSON.parse(JSON.stringify(prev)) as GameRoom;
 
+      room.citizenWord = clues.citizenWord || '사과';
+      room.liarWord = clues.liarWord || '배';
+      room.aiPrompt = clues.aiPrompt || '이 물건을 다섯 글자로 설명해주세요!';
+      room.decoys = clues.decoys || ['복숭아', '수박'];
+      room.category = finalCategory;
+      room.liarMode = liarMode;
+
+      room.players.forEach(p => {
+        p.submission = '';
+        p.votedFor = null;
+        p.role = 'PENDING';
+        p.word = '';
+      });
+
+      const candidatePlayers = room.players.filter(p => !p.isHost);
+      if (candidatePlayers.length < 1) {
+        alert('게임을 시작하려면 최소 1명 이상의 플레이어가 참여해야 합니다!');
+        room.phase = 'LOBBY';
+        setTimeout(() => broadcastToPlayers(room), 0);
+        return room;
+      }
+
+      const liarIndex = Math.floor(Math.random() * candidatePlayers.length);
+      const liarPlayer = candidatePlayers[liarIndex];
+
+      room.players.forEach(p => {
+        if (p.isHost) return;
+        if (p.id === liarPlayer.id) {
+          p.role = 'LIAR';
+          p.word = liarMode === 'RELATED_WORD' ? room.liarWord : '당신은 라이어입니다!';
+        } else {
+          p.role = 'CITIZEN';
+          p.word = room.citizenWord;
+        }
+      });
+
+      room.winner = null;
+      room.roundCount += 1;
+      room.phase = 'ROLE_REVEAL';
+
+      setTimeout(() => broadcastToPlayers(room), 0);
+      return room;
+    });
+  };
+
+  const initializeHostPeer = (code: string, name: string) => {
     setWsStatus('connecting');
+    setConnectionMessage('⚡ 리얼타임 P2P 방 주소 등록 중...');
     setErrorMsg('');
 
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const CLOUD_RUN_DEV_URL = 'wss://ais-dev-f73mcmuyldhv26doe2k27r-254952566287.asia-northeast1.run.app/ws';
-    const CLOUD_RUN_PRE_URL = 'wss://ais-pre-f73mcmuyldhv26doe2k27r-254952566287.asia-northeast1.run.app/ws';
-    const localWsUrl = `${wsProtocol}//${window.location.host}/ws`;
-
-    // Dynamic HTTP touch in background to trigger scale-up / wake-up for sleeping Cloud Run containers
-    try {
-      fetch('https://ais-dev-f73mcmuyldhv26doe2k27r-254952566287.asia-northeast1.run.app/', { mode: 'no-cors' }).catch(() => {});
-      fetch('https://ais-pre-f73mcmuyldhv26doe2k27r-254952566287.asia-northeast1.run.app/', { mode: 'no-cors' }).catch(() => {});
-    } catch (_) {}
-
-    // Multi-tier Fallback Connection URLs List
-    const isStaticDeploy = !window.location.hostname.includes('run.app') && 
-                           !window.location.hostname.includes('localhost') && 
-                           !window.location.hostname.includes('127.0.0.1');
-
-    let urlsToTry: string[] = [];
-    if (isStaticDeploy) {
-      // Vercel / External deploy:
-      // Try DEV URL first since developer container is actively running right now in Workspace.
-      // Then fallback to PRE URL.
-      urlsToTry = [CLOUD_RUN_DEV_URL, CLOUD_RUN_PRE_URL, localWsUrl];
-    } else {
-      urlsToTry = [localWsUrl, CLOUD_RUN_DEV_URL, CLOUD_RUN_PRE_URL];
+    if (peerRef.current) {
+      try { peerRef.current.destroy(); } catch (_) {}
     }
+    playerConnectionsRef.current = {};
 
-    // Determine current target URL
-    let wsUrl = forceUrl;
-    if (!wsUrl) {
-      const idx = wsAttemptIndexRef.current % urlsToTry.length;
-      wsUrl = urlsToTry[idx];
-    }
+    const hostPeerId = `aicatch-tail-${code.toUpperCase()}`;
+    const peer = new Peer(hostPeerId, { debug: 1 });
+    peerRef.current = peer;
 
-    setActiveWsUrl(wsUrl);
-
-    let stepMsg = '';
-    if (wsUrl === CLOUD_RUN_DEV_URL) {
-      stepMsg = '⚡ 1단계: 실시간 개발 환경 서버 연결 중... (Gemini 프록시 부팅)';
-    } else if (wsUrl === CLOUD_RUN_PRE_URL) {
-      stepMsg = '🌐 2단계: 퍼블릭 공유용 클라우드 서버 연결 중... (인스턴스 활성화)';
-    } else {
-      stepMsg = '🔌 3단계: 기본 서비스 게이트웨이 웹소켓 연결 중...';
-    }
-    setConnectionMessage(stepMsg);
-    console.log(`[Socket Attempt] Target=${wsUrl} Code=${code} Host=${isHost}`);
-
-    let socket: WebSocket;
-    try {
-      socket = new WebSocket(wsUrl);
-      wsRef.current = socket;
-    } catch (e) {
-      console.error('WebSocket instantiation error:', e);
-      handleSocketFailure(code, isHost, name, wsUrl, urlsToTry);
-      return;
-    }
-
-    // Timeout watchdog: wait 4.5 seconds for handshaking, then fallback
-    const connectionTimeout = setTimeout(() => {
-      if (socket.readyState !== WebSocket.OPEN) {
-        console.warn('WebSocket connection handshake timed out.');
-        try { socket.close(); } catch (_) {}
-        handleSocketFailure(code, isHost, name, wsUrl, urlsToTry);
-      }
-    }, 4500);
-
-    socket.onopen = () => {
-      clearTimeout(connectionTimeout);
-      console.log('WebSocket connection established successfully:', wsUrl);
+    peer.on('open', (id) => {
+      console.log('Host Peer opened with ID:', id);
       setWsStatus('connected');
-      setErrorMsg('');
       setConnectionMessage('');
-      wsAttemptIndexRef.current = 0; // reset attempts on success
 
-      // Save connection details for automatic re-connect loops
-      connectionDetailsRef.current = { roomCode: code, isHost, nickName: name };
+      const initialRoom: GameRoom = {
+        roomCode: code.toUpperCase(),
+        category: '과일',
+        customCategory: '',
+        citizenWord: '',
+        liarWord: '',
+        aiPrompt: '대기 중입니다...',
+        phase: 'LOBBY',
+        players: [{
+          id: playerId,
+          nickName: name || 'Host',
+          avatarColor: '#1e293b',
+          avatarEmoji: '👑',
+          role: 'PENDING',
+          word: '',
+          submission: '',
+          votedFor: null,
+          points: 0,
+          isHost: true,
+          isConnected: true
+        }],
+        liarMode: 'RELATED_WORD',
+        winner: null,
+        roundCount: 0,
+        decoys: []
+      };
+      setRoom(initialRoom);
+      setViewMode('host');
+    });
 
-      // Immediately Join/Create Section
-      socket.send(JSON.stringify({
-        type: 'JOIN_SESSION',
-        payload: {
-          roomCode: code,
-          playerId,
-          nickName: name,
-          isHost
+    peer.on('connection', (conn) => {
+      console.log('Incoming connection from player:', conn.peer);
+      
+      conn.on('data', (data: any) => {
+        console.log('Host received P2P message:', data);
+        if (data && data.type) {
+          hostProcessAction(data.type, data.payload, conn);
         }
-      }));
-    };
+      });
 
-    socket.onmessage = (event) => {
-      try {
-        const { type, payload } = JSON.parse(event.data);
-        console.log(`Socket received message: ${type}`, payload);
-
-        if (type === 'STATE_UPDATE') {
-          setRoom(payload);
-          setErrorMsg('');
-          if (isHost && viewMode !== 'host') {
-            setViewMode('host');
-          } else if (!isHost && viewMode !== 'player') {
-            setViewMode('player');
+      conn.on('close', () => {
+        setRoom((prev) => {
+          if (!prev) return null;
+          const next = JSON.parse(JSON.stringify(prev)) as GameRoom;
+          const pId = Object.keys(playerConnectionsRef.current).find(
+            key => playerConnectionsRef.current[key] === conn
+          );
+          if (pId) {
+            const player = next.players.find(p => p.id === pId);
+            if (player) {
+              player.isConnected = false;
+              console.log(`Player ${player.nickName} disconnected`);
+            }
           }
-        } else if (type === 'JOIN_ERROR') {
-          setErrorMsg(payload.message || '방 가입 중 에러가 발생했습니다.');
-          connectionDetailsRef.current = null;
-          try { socket.close(); } catch (_) {}
-          setViewMode('landing');
-        } else if (type === 'GAME_ERROR') {
-          alert(payload.message || '게임 에러가 발생했습니다.');
-        }
-      } catch (err) {
-        console.error('Failed to parse incoming WS message:', err);
-      }
-    };
+          setTimeout(() => broadcastToPlayers(next), 0);
+          return next;
+        });
+      });
+    });
 
-    socket.onclose = () => {
-      clearTimeout(connectionTimeout);
-      console.log('WebSocket closed');
-      
-      // If we closed deliberately by exit, do not trigger reconnect or errors
-      if (!connectionDetailsRef.current) {
-        setWsStatus('disconnected');
-        return;
+    peer.on('error', (err: any) => {
+      console.error('Host peer error:', err);
+      if (err.type === 'unavailable-id') {
+        setErrorMsg('이미 누군지 선점된 방 코드입니다. 다른 임의의 코드로 다시 생성해보세요!');
+      } else {
+        setErrorMsg(`P2P 네트워크 지연: ${err.message || err.type}`);
       }
-
       setWsStatus('disconnected');
-      setErrorMsg('서버와 연결이 유실되었습니다. 예비 터널로 자동 우회/재연결합니다...');
-      
-      // Attempt reconnect with next URL in queue
-      reconnectTimeoutRef.current = setTimeout(() => {
-        wsAttemptIndexRef.current += 1;
-        connectWebSocket(code, isHost, name);
-      }, 1500);
-    };
-
-    socket.onerror = (err) => {
-      clearTimeout(connectionTimeout);
-      console.error('WebSocket error event structure:', err);
-      // Let onclose handle the fallback & retry cycle
-    };
+    });
   };
 
-  // Separated socket failure router to safely go through tier list
-  const handleSocketFailure = (code: string, isHost: boolean, name: string, failedUrl: string, urlList: string[]) => {
-    wsAttemptIndexRef.current += 1;
-    const nextIdx = wsAttemptIndexRef.current % urlList.length;
-    const nextUrl = urlList[nextIdx];
-    
-    setErrorMsg(`[서버 접속 지연] 다음 대체 터널로 조인하는 중... (${wsAttemptIndexRef.current}차 시도)`);
-    console.log(`Routing connection to fallback index=${nextIdx} URL=${nextUrl}`);
+  const initializePlayerPeer = (code: string, name: string) => {
+    setWsStatus('connecting');
+    setConnectionMessage('⚡ 방장과 다이렉트 WebRTC 터널 생성 중...');
+    setErrorMsg('');
 
-    // Wait 1.0 second before trying next server in queue to prevent tight spinning
-    reconnectTimeoutRef.current = setTimeout(() => {
-      connectWebSocket(code, isHost, name, nextUrl);
-    }, 1000);
+    if (peerRef.current) {
+      try { peerRef.current.destroy(); } catch (_) {}
+    }
+    if (hostConnRef.current) {
+      try { hostConnRef.current.close(); } catch (_) {}
+    }
+
+    const peer = new Peer({ debug: 1 });
+    peerRef.current = peer;
+
+    peer.on('open', (myPeerId) => {
+      console.log('Player peer opened with code:', myPeerId);
+      const hostId = `aicatch-tail-${code.toUpperCase()}`;
+      setConnectionMessage(`🌐 방장 통신 검색 중 (ID: ${code.toUpperCase()})...`);
+
+      const conn = peer.connect(hostId, { reliable: true });
+      hostConnRef.current = conn;
+
+      const connTimeout = setTimeout(() => {
+        if (!conn.open) {
+          setErrorMsg('방장을 찾을 수 없습니다. 대기방(로비) 화면의 방 코드가 일치하는지 확인해 주세요.');
+          setWsStatus('disconnected');
+          try { conn.close(); } catch (_) {}
+        }
+      }, 7000);
+
+      conn.on('open', () => {
+        clearTimeout(connTimeout);
+        console.log('Connected to Host Peer successfully');
+        setWsStatus('connected');
+        setConnectionMessage('');
+        setErrorMsg('');
+
+        conn.send({
+          type: 'JOIN_SESSION',
+          payload: {
+            playerId,
+            nickName: name,
+            isHost: false
+          }
+        });
+      });
+
+      conn.on('data', (data: any) => {
+        console.log('Player received state update:', data);
+        if (data && data.type) {
+          if (data.type === 'STATE_UPDATE') {
+            setRoom(data.payload);
+            setViewMode('player');
+            setErrorMsg('');
+          } else if (data.type === 'JOIN_ERROR') {
+            setErrorMsg(data.payload.message || '방 참가 거부됨');
+            setWsStatus('disconnected');
+            setViewMode('landing');
+            try { peer.destroy(); } catch (_) {}
+          }
+        }
+      });
+
+      conn.on('close', () => {
+        console.log('Host closed connection');
+        setWsStatus('disconnected');
+        setErrorMsg('방장과 연결이 끊겼습니다. 메인 화면으로 이동합니다.');
+        setViewMode('landing');
+      });
+    });
+
+    peer.on('error', (err: any) => {
+      console.error('Player connection error:', err);
+      setErrorMsg(`P2P 연결 실패: 방 코드가 올바른가요? (${err.message || err.type})`);
+      setWsStatus('disconnected');
+    });
   };
 
-  // Safe action dispatch sender helper
   const sendAction = (type: string, payload: any) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type, payload }));
+    if (viewMode === 'host') {
+      if (type === 'START_GAME') {
+        hostStartGameAsync(payload.category, payload.customCategory, payload.liarMode);
+      } else {
+        hostProcessAction(type, payload);
+      }
     } else {
-      console.warn('Socket is not open. Action aborted:', type);
-      setErrorMsg('서버와 실시간 연결이 원활하지 않습니다. 재연결 중입니다...');
+      if (hostConnRef.current && hostConnRef.current.open) {
+        hostConnRef.current.send({ type, payload });
+      } else {
+        console.warn('Cannot send action. Connection lost.');
+        setErrorMsg('방장과의 연결 수신 감도가 나쁩니다. 재연결을 진행하세요.');
+      }
     }
   };
 
   const handleCreateRoom = () => {
-    // Generate valid 4 letter uppercase room code
     const randomCode = Math.random().toString(36).substring(2, 6).toUpperCase();
     setRoomCode(randomCode);
-    connectWebSocket(randomCode, true, 'Host');
+    initializeHostPeer(randomCode, 'Host');
   };
 
   const handleJoinOrCreatePlayer = (e: React.FormEvent) => {
@@ -229,22 +596,23 @@ export default function App() {
       return;
     }
     setErrorMsg('');
-    connectWebSocket(roomCode.trim().toUpperCase(), false, nickname.trim());
+    initializePlayerPeer(roomCode.trim().toUpperCase(), nickname.trim());
   };
 
-  // Exits the current room session and cleans listeners
   const handleExitRoom = () => {
-    connectionDetailsRef.current = null;
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current);
+    if (peerRef.current) {
+      try { peerRef.current.destroy(); } catch (_) {}
     }
-    if (wsRef.current) {
-      wsRef.current.close();
+    if (hostConnRef.current) {
+      try { hostConnRef.current.close(); } catch (_) {}
     }
-    wsRef.current = null;
+    peerRef.current = null;
+    hostConnRef.current = null;
+    playerConnectionsRef.current = {};
     setRoom(null);
     setViewMode('landing');
     setErrorMsg('');
+    setWsStatus('disconnected');
   };
 
   // Check for URL parameters on mount
@@ -256,14 +624,7 @@ export default function App() {
     }
   }, []);
 
-  // Clean timeouts on unmount
-  useEffect(() => {
-    return () => {
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current);
-      }
-    };
-  }, []);
+
 
   // Check if we are on a developer preview URL
   const isDevUrl = window.location.href.includes('ais-dev-');
@@ -316,7 +677,7 @@ export default function App() {
           {wsStatus === 'connected' && (
             <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 font-bold text-[11px] md:text-xs">
               <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-ping" />
-              {activeWsUrl.includes('ais-pre') ? '🌐 멀티플레이 클라우드 서버 연결 완료' : '🟢 로컬 서버 연결 완료'}
+              {viewMode === 'host' ? '👑 P2P 실시간 호스트 채널 활성화' : '🟢 P2P 실시간 로비 참가 완료'}
             </span>
           )}
         </div>
