@@ -79,6 +79,8 @@ export default function App() {
           }
         } else if (type === 'JOIN_ERROR') {
           setErrorMsg(payload.message || '방 가입 중 에러가 발생했습니다.');
+          // Clear connectionDetailsRef BEFORE closing to skip reconnect
+          connectionDetailsRef.current = null;
           socket.close();
           setViewMode('landing');
         } else if (type === 'GAME_ERROR') {
@@ -108,7 +110,9 @@ export default function App() {
 
     socket.onerror = (err) => {
       console.error('WebSocket encountered an error:', err);
-      setErrorMsg('실시간 게임 서버 연결에 실패했습니다. 방 번호가 존재하지 않거나, 서버가 부팅 중일 수 있습니다.');
+      if (connectionDetailsRef.current) {
+        setErrorMsg('실시간 게임 서버 연결에 실패했습니다. 방 번호가 존재하지 않거나, 서버가 부팅 중일 수 있습니다.');
+      }
     };
   };
 
@@ -292,7 +296,7 @@ export default function App() {
                           type="text"
                           maxLength={4}
                           value={roomCode}
-                          onChange={(e) => setRoomCode(e.target.value)}
+                          onChange={(e) => setRoomCode(e.target.value.replace(/\s/g, '').toUpperCase())}
                           placeholder="A7E3"
                           className="w-full bg-slate-50 hover:bg-slate-50 focus:bg-white border focus:border-indigo-500 rounded-xl py-3 px-4 outline-none font-mono font-bold text-lg text-center tracking-widest transition-all placeholder:font-sans placeholder:tracking-normal uppercase"
                         />
@@ -326,6 +330,10 @@ export default function App() {
                       <ArrowRight className="w-4 h-4" />
                     </button>
                   </form>
+
+                  <div className="mt-4 bg-indigo-50/50 border border-indigo-100 rounded-xl p-3.5 text-[11px] text-indigo-950 leading-relaxed font-medium">
+                    💡 <b className="text-indigo-700">멀티플레이 팁</b>: 친구들과 같이 게임할 때는 방장(호스트)과 플레이어 모두 <b>완전히 동일한 주소</b>(예: 둘 다 Dev URL, 또는 둘 다 Shared URL)로 브라우저 탭을 열고 참여해야 정상 동기화됩니다!
+                  </div>
                 </div>
               </div>
             </motion.div>
