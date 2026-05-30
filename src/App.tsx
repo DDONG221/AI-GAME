@@ -22,30 +22,73 @@ export default function App() {
   const [room, setRoom] = useState<GameRoom | null>(null);
   const [errorMsg, setErrorMsg] = useState('');
   const [wsStatus, setWsStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
+  const [activeWsUrl, setActiveWsUrl] = useState<string>('');
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const connectionDetailsRef = useRef<{ roomCode: string; isHost: boolean; nickName: string } | null>(null);
 
-  // Initialize and connect WebSocket with automatic reconnection loop
-  const connectWebSocket = (code: string, isHost: boolean, name: string) => {
+  // Initialize and connect WebSocket with smart automatic fallback reconnection loop
+  const connectWebSocket = (code: string, isHost: boolean, name: string, forceUrl?: string) => {
     if (wsRef.current) {
-      wsRef.current.close();
+      try {
+        wsRef.current.close();
+      } catch (_) {}
+    }
+
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
     }
 
     setWsStatus('connecting');
     setErrorMsg('');
 
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    // Handle the proxy route securely inside AI Studio context
-    const wsUrl = `${wsProtocol}//${window.location.host}/ws`;
+    const CLOUD_RUN_WS_URL = 'wss://ais-pre-f73mcmuyldhv26doe2k27r-254952566287.asia-northeast1.run.app/ws';
     
-    console.log(`Connecting to WebSocket on: ${wsUrl}`);
-    const socket = new WebSocket(wsUrl);
-    wsRef.current = socket;
+    // Choose connection path:
+    // If we are on static host like Vercel, Netlify, or GitHub Pages, default immediately to Cloud Run because those platforms do not run server.ts backends.
+    const isStaticDeploy = window.location.hostname.includes('vercel.app') || 
+                           window.location.hostname.includes('netlify.app') || 
+                           window.location.hostname.includes('github.io');
+                           
+    let wsUrl = forceUrl || (isStaticDeploy ? CLOUD_RUN_WS_URL : `${wsProtocol}//${window.location.host}/ws`);
+    
+    setActiveWsUrl(wsUrl);
+    console.log(`Connecting to WebSocket on URL: ${wsUrl}`);
+    
+    let socket: WebSocket;
+    try {
+      socket = new WebSocket(wsUrl);
+      wsRef.current = socket;
+    } catch (e) {
+      console.error('Failed to instantiate WebSocket:', e);
+      if (wsUrl !== CLOUD_RUN_WS_URL) {
+        console.log('Instant fallback to central Cloud Run gateway (instantiation error)...');
+        connectWebSocket(code, isHost, name, CLOUD_RUN_WS_URL);
+      } else {
+        setErrorMsg('서버 소켓 생성 실패. 인터넷 연결을 확인해 주세요.');
+        setWsStatus('disconnected');
+      }
+      return;
+    }
+
+    // Timeout watchdog: if we can't connect in 3 seconds to a local/non-fallback url, fall back to central Cloud Run
+    const connectionTimeout = setTimeout(() => {
+      if (socket.readyState !== WebSocket.OPEN) {
+        console.warn('WebSocket connection attempt timeout. Falling back to central public server...');
+        if (wsUrl !== CLOUD_RUN_WS_URL) {
+          setErrorMsg('서버와 실시간 연결 중... 클라우드 멀티플레이 서버로 우회 접속합니다.');
+          try { socket.close(); } catch (_) {}
+          // Connect using stable Cloud Run gateway
+          connectWebSocket(code, isHost, name, CLOUD_RUN_WS_URL);
+        }
+      }
+    }, 3000);
 
     socket.onopen = () => {
-      console.log('WebSocket successfully opened');
+      clearTimeout(connectionTimeout);
+      console.log('WebSocket successfully opened on url:', wsUrl);
       setWsStatus('connected');
       
       // Save details for reconnects
@@ -79,9 +122,8 @@ export default function App() {
           }
         } else if (type === 'JOIN_ERROR') {
           setErrorMsg(payload.message || '방 가입 중 에러가 발생했습니다.');
-          // Clear connectionDetailsRef BEFORE closing to skip reconnect
           connectionDetailsRef.current = null;
-          socket.close();
+          try { socket.close(); } catch (_) {}
           setViewMode('landing');
         } else if (type === 'GAME_ERROR') {
           alert(payload.message || '게임 에러가 발생했습니다.');
@@ -92,26 +134,34 @@ export default function App() {
     };
 
     socket.onclose = () => {
+      clearTimeout(connectionTimeout);
       console.log('WebSocket closed');
       setWsStatus('disconnected');
       
       // Trigger reconnection only if we have active game intent and didn't close deliberately
       if (connectionDetailsRef.current) {
-        setErrorMsg('서버 연결이 해제되었습니다. 2.5초 후 자동 재연결합니다...');
+        setErrorMsg('서버 실시간 연결 해제됨. 2.5초 후 재연결을 시도합니다...');
         console.log('Reconnection triggered in 2.5 seconds...');
         reconnectTimeoutRef.current = setTimeout(() => {
           const det = connectionDetailsRef.current;
           if (det) {
-            connectWebSocket(det.roomCode, det.isHost, det.nickName);
+            connectWebSocket(det.roomCode, det.isHost, det.nickName, wsUrl);
           }
         }, 2500);
       }
     };
 
     socket.onerror = (err) => {
+      clearTimeout(connectionTimeout);
       console.error('WebSocket encountered an error:', err);
-      if (connectionDetailsRef.current) {
-        setErrorMsg('실시간 게임 서버 연결에 실패했습니다. 방 번호가 존재하지 않거나, 서버가 부팅 중일 수 있습니다.');
+      if (wsUrl !== CLOUD_RUN_WS_URL) {
+        console.log('Attempting instant fallback to central Cloud Run gateway...');
+        try { socket.close(); } catch (_) {}
+        connectWebSocket(code, isHost, name, CLOUD_RUN_WS_URL);
+      } else {
+        if (connectionDetailsRef.current) {
+          setErrorMsg('실시간 게임 서버 연결에 실패했습니다. 방 번호가 존재하지 않거나 클라우드 서버 부팅 중일 수 있습니다.');
+        }
       }
     };
   };
@@ -225,13 +275,13 @@ export default function App() {
           {wsStatus === 'connecting' && (
             <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-yellow-50 text-yellow-700 border border-yellow-200">
               <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-              재연결 중...
+              서버 연결 중...
             </span>
           )}
           {wsStatus === 'connected' && (
-            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 font-bold">
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 font-bold text-[11px] md:text-xs">
               <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-ping" />
-              서버 연결됨
+              {activeWsUrl.includes('ais-pre') ? '🌐 멀티플레이 클라우드 서버 연결 완료' : '🟢 로컬 서버 연결 완료'}
             </span>
           )}
         </div>
