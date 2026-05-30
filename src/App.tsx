@@ -95,6 +95,7 @@ export default function App() {
       
       // Trigger reconnection only if we have active game intent and didn't close deliberately
       if (connectionDetailsRef.current) {
+        setErrorMsg('서버 연결이 해제되었습니다. 2.5초 후 자동 재연결합니다...');
         console.log('Reconnection triggered in 2.5 seconds...');
         reconnectTimeoutRef.current = setTimeout(() => {
           const det = connectionDetailsRef.current;
@@ -107,6 +108,7 @@ export default function App() {
 
     socket.onerror = (err) => {
       console.error('WebSocket encountered an error:', err);
+      setErrorMsg('실시간 게임 서버 연결에 실패했습니다. 방 번호가 존재하지 않거나, 서버가 부팅 중일 수 있습니다.');
     };
   };
 

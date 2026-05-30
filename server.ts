@@ -499,15 +499,21 @@ wss.on('connection', (ws: CustomWebSocket) => {
   });
 });
 
-// Attach WS handler to our server and upgrades
+// Attach WS handler to our server and upgrades securely
 server.on('upgrade', (request, socket, head) => {
-  const pathname = new URL(request.url || '', `http://${request.headers.host}`).pathname;
-  if (pathname === '/ws') {
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      wss.emit('connection', ws, request);
-    });
-  } else {
-    socket.destroy();
+  try {
+    const url = request.url || '';
+    const pathname = url.split('?')[0]; // Safe split that avoids fragile URL host-base parsing
+    if (pathname === '/ws' || pathname === '/ws/') {
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit('connection', ws, request);
+      });
+    } else {
+      socket.destroy();
+    }
+  } catch (err) {
+    console.error('Error during websocket upgrade handshaking:', err);
+    try { socket.destroy(); } catch (_) {}
   }
 });
 
