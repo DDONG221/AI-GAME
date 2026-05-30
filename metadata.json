@@ -1,0 +1,6 @@
+{
+  "name": "AI 꼬리잡기 (AI Catch the Tail)",
+  "description": "실시간 멀티플레이어로 즐기는 AI 융합 라이어 파티 게임으로, 호스트가 전광판을 열고 참가자들은 모바일로 접속해 AI 돌발 질문에 답하며 라이어를 가려내는 게임입니다.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
