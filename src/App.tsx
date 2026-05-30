@@ -162,6 +162,15 @@ export default function App() {
     setErrorMsg('');
   };
 
+  // Check for URL parameters on mount
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const codeFromUrl = params.get('code');
+    if (codeFromUrl) {
+      setRoomCode(codeFromUrl.toUpperCase());
+    }
+  }, []);
+
   // Clean timeouts on unmount
   useEffect(() => {
     return () => {
@@ -170,6 +179,23 @@ export default function App() {
       }
     };
   }, []);
+
+  // Check if we are on a developer preview URL
+  const isDevUrl = window.location.href.includes('ais-dev-');
+
+  // Calculate the shared public URL from the development URL (replaces ais-dev with ais-pre)
+  const getSharedUrl = () => {
+    const origin = window.location.origin;
+    if (origin.includes('ais-dev-')) {
+      return origin.replace('ais-dev-', 'ais-pre-');
+    }
+    return origin;
+  };
+
+  const copySharedUrl = () => {
+    navigator.clipboard.writeText(getSharedUrl());
+    alert('공유용 접속 주소(Shared URL)가 성공적으로 복사되었습니다! 친구들에게 이 주소를 전달하여 참여하게 하세요.');
+  };
 
   return (
     <div className="min-h-screen bg-slate-100 flex flex-col justify-between" id="app-root">
@@ -331,9 +357,35 @@ export default function App() {
                     </button>
                   </form>
 
-                  <div className="mt-4 bg-indigo-50/50 border border-indigo-100 rounded-xl p-3.5 text-[11px] text-indigo-950 leading-relaxed font-medium">
-                    💡 <b className="text-indigo-700">멀티플레이 팁</b>: 친구들과 같이 게임할 때는 방장(호스트)과 플레이어 모두 <b>완전히 동일한 주소</b>(예: 둘 다 Dev URL, 또는 둘 다 Shared URL)로 브라우저 탭을 열고 참여해야 정상 동기화됩니다!
-                  </div>
+                  {isDevUrl ? (
+                    <div className="mt-4 bg-amber-50 border border-amber-200 rounded-xl p-4 text-[11px] text-amber-950 leading-relaxed font-medium space-y-2">
+                      <p className="text-amber-800 font-bold flex items-center gap-1">
+                        ⚠️ 개발용(Dev) 프리뷰 화면 감지됨
+                      </p>
+                      <p>
+                        현재 이 주소는 <b>개발 환경 전전용(Dev) 화면</b>입니다. 개발자 전용 보안 제한 때문에 <b>친구들이나 휴대전화 등 외부 디바이스에서 이 방으로 접속할 수 없습니다.</b>
+                      </p>
+                      <p className="text-amber-900">
+                        친구들과 실시간 멀티플레이를 테스트하거나 실제로 즐기시려면, 아래의 <b>공유용(Shared) 정식 주소</b>로 모두 접속해 주세요!
+                      </p>
+                      <div className="pt-1 flex flex-col gap-1.5">
+                        <span className="font-mono bg-white border border-amber-300 text-slate-700 px-2 py-1 rounded select-all block break-all text-center font-bold">
+                          {getSharedUrl()}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={copySharedUrl}
+                          className="mt-1 bg-amber-600 hover:bg-amber-700 hover:scale-[1.02] text-white font-bold py-2 px-3 rounded-lg text-center cursor-pointer transition-all text-[11px] shadow-sm"
+                        >
+                          📋 공유용 링크 복사하기
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="mt-4 bg-indigo-50/50 border border-indigo-100 rounded-xl p-3.5 text-[11px] text-indigo-950 leading-relaxed font-medium">
+                      💡 <b className="text-indigo-700">멀티플레이 팁</b>: 친구들과 같이 게임할 때는 방장(호스트)과 플레이어 모두 <b>동일한 공유용 주소(Shared URL)</b>로 브라우저 탭을 열고 동일한 코드를 입력해 입장하고 플레이해야 정상 동기화됩니다!
+                    </div>
+                  )}
                 </div>
               </div>
             </motion.div>

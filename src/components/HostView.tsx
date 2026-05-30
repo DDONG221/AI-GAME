@@ -14,6 +14,22 @@ export default function HostView({ room, playerId, sendAction }: HostViewProps) 
   const [customCat, setCustomCat] = useState('');
   const [liarMode, setLiarMode] = useState<'RELATED_WORD' | 'NO_WORD'>('RELATED_WORD');
   const [showNamesInReveal, setShowNamesInReveal] = useState(false);
+  const [copiedLink, setCopiedLink] = useState(false);
+
+  // Helper to determine the secure public URL for players
+  const getPublicJoinUrl = () => {
+    let origin = window.location.origin;
+    if (origin.includes('ais-dev-')) {
+      origin = origin.replace('ais-dev-', 'ais-pre-');
+    }
+    return `${origin}/?code=${room.roomCode}`;
+  };
+
+  const handleCopyInviteLink = () => {
+    navigator.clipboard.writeText(getPublicJoinUrl());
+    setCopiedLink(true);
+    setTimeout(() => setCopiedLink(false), 2000);
+  };
 
   const activePlayers = room.players.filter(p => !p.isHost);
   const connectedPlayers = activePlayers.filter(p => p.isConnected);
@@ -89,9 +105,19 @@ export default function HostView({ room, playerId, sendAction }: HostViewProps) 
         </div>
 
         <div className="flex items-center gap-4">
+          <button
+            onClick={handleCopyInviteLink}
+            className={`flex items-center gap-1.5 font-bold text-xs py-2.5 px-4 rounded-xl transition-all cursor-pointer ${
+              copiedLink
+                ? 'bg-emerald-500 text-white shadow-md shadow-emerald-100'
+                : 'bg-indigo-50 hover:bg-indigo-100 text-indigo-600'
+            }`}
+          >
+            {copiedLink ? '✓ 초대 링크 복사됨!' : '📱 초대용 링크 복사'}
+          </button>
           <div className="text-right">
             <p className="text-xs text-slate-400 font-mono">ROOM CODE</p>
-            <p className="text-2xl font-black text-indigo-600 tracking-widest font-mono select-all">
+            <p className="text-2xl font-black text-indigo-600 tracking-widest font-mono select-all animate-pulse">
               {room.roomCode}
             </p>
           </div>
@@ -223,9 +249,17 @@ export default function HostView({ room, playerId, sendAction }: HostViewProps) 
                     <div className="w-16 h-16 bg-slate-50 rounded-2xl flex items-center justify-center text-2xl animate-pulse">
                       📱
                     </div>
-                    <div>
+                    <div className="space-y-3 px-2">
                       <p className="font-bold text-slate-600">접속을 대기하는 중입니다.</p>
-                      <p className="text-xs mt-1">기기에서 메인 웹사이트에 접속 후 <br/> 방 코드 <b>{room.roomCode}</b>을 통해 들어가세요.</p>
+                      <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">
+                        상단의 <b>[📱  초대용 링크 복사]</b> 버튼을 누르면 <br />
+                        자동으로 방 코드가 입력되는 전용 링크가 복사됩니다! <br />
+                        친구들이나 모바일 등 다른 기기의 브라우저 주소창에 <br />
+                        해당 주소를 열어서 입장하게 하세요.
+                      </p>
+                      <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-[10px] text-amber-950 leading-relaxed text-left font-medium">
+                        ⚠️ <b>잠깐! 멀티플레이 팁</b>: 대기실 화면과 모바일은 꼭 <b>동일한 웹주소(보안 제한이 없는 공유용 Shared URL)</b> 상에 있을 때 실시간 방 입장을 허용합니다.
+                      </div>
                     </div>
                   </div>
                 ) : (
