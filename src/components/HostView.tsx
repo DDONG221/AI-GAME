@@ -100,7 +100,7 @@ export default function HostView({ room, playerId, sendAction }: HostViewProps) 
           </div>
           <div className="flex items-center gap-1.5 text-slate-600 text-sm font-medium">
             <Users className="w-4 h-4 text-slate-400" />
-            참여자 {connectedPlayers.length}/{activePlayers.length}명
+            참여자 {activePlayers.length}/30명 (접속: {connectedPlayers.length}명)
           </div>
         </div>
 
@@ -240,7 +240,7 @@ export default function HostView({ room, playerId, sendAction }: HostViewProps) 
                 <div className="flex items-center justify-between mb-6">
                   <h2 className="text-xl font-bold text-slate-800 flex items-center gap-2">
                     <Users className="w-5 h-5 text-indigo-600" />
-                    대기실 참여자 ({activePlayers.length}명)
+                    대기실 참여자 ({activePlayers.length}/30명)
                   </h2>
                 </div>
 

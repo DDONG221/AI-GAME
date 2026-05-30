@@ -141,7 +141,9 @@ export default function PlayerView({ room, playerId, sendAction }: PlayerViewPro
 
             {/* List of other connected players in a compact way */}
             <div className="border-t border-slate-100 pt-5">
-              <p className="text-[10px] text-slate-400 uppercase font-bold tracking-wider mb-3">접속된 참여자 실시간</p>
+              <p className="text-[10px] text-slate-400 uppercase font-bold tracking-wider mb-3">
+                접속된 참여자 ({room.players.filter(p => !p.isHost).length}/30명)
+              </p>
               <div className="flex flex-wrap justify-center gap-1.5 max-h-[120px] overflow-y-auto">
                 {room.players.map(p => (
                   <span

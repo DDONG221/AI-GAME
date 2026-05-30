@@ -195,6 +195,16 @@ wss.on('connection', (ws: CustomWebSocket) => {
                 return;
               }
 
+              // Check for maximum capacity limit (30 players maximum, excluding host)
+              const activePlayers = room.players.filter(p => !p.isHost);
+              if (activePlayers.length >= 30) {
+                ws.send(JSON.stringify({
+                  type: 'JOIN_ERROR',
+                  payload: { message: '방 정원이 가득 찼습니다. (최대 30명)' }
+                }));
+                return;
+              }
+
               // Assign random color and emoji
               const avatarEmoji = AVATAR_EMOJIS[room.players.length % AVATAR_EMOJIS.length];
               const avatarColor = AVATAR_COLORS[room.players.length % AVATAR_COLORS.length];

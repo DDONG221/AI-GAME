@@ -136,7 +136,19 @@ export default function App() {
               return prevRoom;
             }
 
+            // Check for maximum capacity limit (30 players maximum, excluding host)
+            const activePlayers = room.players.filter(p => !p.isHost);
             let player = room.players.find(p => p.id === pId);
+            if (!player && activePlayers.length >= 30) {
+              if (senderConn) {
+                senderConn.send({
+                  type: 'JOIN_ERROR',
+                  payload: { message: '방 정원이 가득 찼습니다. (최대 30명)' }
+                });
+              }
+              return prevRoom;
+            }
+
             if (!player) {
               const avatarEmoji = AVATAR_EMOJIS[room.players.length % AVATAR_EMOJIS.length];
               const avatarColor = AVATAR_COLORS[room.players.length % AVATAR_COLORS.length];
