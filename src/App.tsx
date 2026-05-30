@@ -23,8 +23,10 @@ export default function App() {
   const [errorMsg, setErrorMsg] = useState('');
   const [wsStatus, setWsStatus] = useState<'disconnected' | 'connecting' | 'connected'>('disconnected');
   const [activeWsUrl, setActiveWsUrl] = useState<string>('');
+  const [connectionMessage, setConnectionMessage] = useState<string>('');
 
   const wsRef = useRef<WebSocket | null>(null);
+  const wsAttemptIndexRef = useRef<number>(0);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const connectionDetailsRef = useRef<{ roomCode: string; isHost: boolean; nickName: string } | null>(null);
 
@@ -44,58 +46,83 @@ export default function App() {
     setErrorMsg('');
 
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const CLOUD_RUN_WS_URL = 'wss://ais-pre-f73mcmuyldhv26doe2k27r-254952566287.asia-northeast1.run.app/ws';
-    
-    // Choose connection path:
-    // If we are on static host like Vercel, Netlify, or GitHub Pages, default immediately to Cloud Run because those platforms do not run server.ts backends.
-    const isStaticDeploy = window.location.hostname.includes('vercel.app') || 
-                           window.location.hostname.includes('netlify.app') || 
-                           window.location.hostname.includes('github.io');
-                           
-    let wsUrl = forceUrl || (isStaticDeploy ? CLOUD_RUN_WS_URL : `${wsProtocol}//${window.location.host}/ws`);
-    
+    const CLOUD_RUN_DEV_URL = 'wss://ais-dev-f73mcmuyldhv26doe2k27r-254952566287.asia-northeast1.run.app/ws';
+    const CLOUD_RUN_PRE_URL = 'wss://ais-pre-f73mcmuyldhv26doe2k27r-254952566287.asia-northeast1.run.app/ws';
+    const localWsUrl = `${wsProtocol}//${window.location.host}/ws`;
+
+    // Dynamic HTTP touch in background to trigger scale-up / wake-up for sleeping Cloud Run containers
+    try {
+      fetch('https://ais-dev-f73mcmuyldhv26doe2k27r-254952566287.asia-northeast1.run.app/', { mode: 'no-cors' }).catch(() => {});
+      fetch('https://ais-pre-f73mcmuyldhv26doe2k27r-254952566287.asia-northeast1.run.app/', { mode: 'no-cors' }).catch(() => {});
+    } catch (_) {}
+
+    // Multi-tier Fallback Connection URLs List
+    const isStaticDeploy = !window.location.hostname.includes('run.app') && 
+                           !window.location.hostname.includes('localhost') && 
+                           !window.location.hostname.includes('127.0.0.1');
+
+    let urlsToTry: string[] = [];
+    if (isStaticDeploy) {
+      // Vercel / External deploy:
+      // Try DEV URL first since developer container is actively running right now in Workspace.
+      // Then fallback to PRE URL.
+      urlsToTry = [CLOUD_RUN_DEV_URL, CLOUD_RUN_PRE_URL, localWsUrl];
+    } else {
+      urlsToTry = [localWsUrl, CLOUD_RUN_DEV_URL, CLOUD_RUN_PRE_URL];
+    }
+
+    // Determine current target URL
+    let wsUrl = forceUrl;
+    if (!wsUrl) {
+      const idx = wsAttemptIndexRef.current % urlsToTry.length;
+      wsUrl = urlsToTry[idx];
+    }
+
     setActiveWsUrl(wsUrl);
-    console.log(`Connecting to WebSocket on URL: ${wsUrl}`);
-    
+
+    let stepMsg = '';
+    if (wsUrl === CLOUD_RUN_DEV_URL) {
+      stepMsg = '⚡ 1단계: 실시간 개발 환경 서버 연결 중... (Gemini 프록시 부팅)';
+    } else if (wsUrl === CLOUD_RUN_PRE_URL) {
+      stepMsg = '🌐 2단계: 퍼블릭 공유용 클라우드 서버 연결 중... (인스턴스 활성화)';
+    } else {
+      stepMsg = '🔌 3단계: 기본 서비스 게이트웨이 웹소켓 연결 중...';
+    }
+    setConnectionMessage(stepMsg);
+    console.log(`[Socket Attempt] Target=${wsUrl} Code=${code} Host=${isHost}`);
+
     let socket: WebSocket;
     try {
       socket = new WebSocket(wsUrl);
       wsRef.current = socket;
     } catch (e) {
-      console.error('Failed to instantiate WebSocket:', e);
-      if (wsUrl !== CLOUD_RUN_WS_URL) {
-        console.log('Instant fallback to central Cloud Run gateway (instantiation error)...');
-        connectWebSocket(code, isHost, name, CLOUD_RUN_WS_URL);
-      } else {
-        setErrorMsg('서버 소켓 생성 실패. 인터넷 연결을 확인해 주세요.');
-        setWsStatus('disconnected');
-      }
+      console.error('WebSocket instantiation error:', e);
+      handleSocketFailure(code, isHost, name, wsUrl, urlsToTry);
       return;
     }
 
-    // Timeout watchdog: if we can't connect in 3 seconds to a local/non-fallback url, fall back to central Cloud Run
+    // Timeout watchdog: wait 4.5 seconds for handshaking, then fallback
     const connectionTimeout = setTimeout(() => {
       if (socket.readyState !== WebSocket.OPEN) {
-        console.warn('WebSocket connection attempt timeout. Falling back to central public server...');
-        if (wsUrl !== CLOUD_RUN_WS_URL) {
-          setErrorMsg('서버와 실시간 연결 중... 클라우드 멀티플레이 서버로 우회 접속합니다.');
-          try { socket.close(); } catch (_) {}
-          // Connect using stable Cloud Run gateway
-          connectWebSocket(code, isHost, name, CLOUD_RUN_WS_URL);
-        }
+        console.warn('WebSocket connection handshake timed out.');
+        try { socket.close(); } catch (_) {}
+        handleSocketFailure(code, isHost, name, wsUrl, urlsToTry);
       }
-    }, 3000);
+    }, 4500);
 
     socket.onopen = () => {
       clearTimeout(connectionTimeout);
-      console.log('WebSocket successfully opened on url:', wsUrl);
+      console.log('WebSocket connection established successfully:', wsUrl);
       setWsStatus('connected');
-      
-      // Save details for reconnects
+      setErrorMsg('');
+      setConnectionMessage('');
+      wsAttemptIndexRef.current = 0; // reset attempts on success
+
+      // Save connection details for automatic re-connect loops
       connectionDetailsRef.current = { roomCode: code, isHost, nickName: name };
 
-      // Immediately Join Session
-      const joinMsg: WSMessage = {
+      // Immediately Join/Create Section
+      socket.send(JSON.stringify({
         type: 'JOIN_SESSION',
         payload: {
           roomCode: code,
@@ -103,14 +130,13 @@ export default function App() {
           nickName: name,
           isHost
         }
-      };
-      socket.send(JSON.stringify(joinMsg));
+      }));
     };
 
     socket.onmessage = (event) => {
       try {
         const { type, payload } = JSON.parse(event.data);
-        console.log(`Client received message: ${type}`, payload);
+        console.log(`Socket received message: ${type}`, payload);
 
         if (type === 'STATE_UPDATE') {
           setRoom(payload);
@@ -136,34 +162,43 @@ export default function App() {
     socket.onclose = () => {
       clearTimeout(connectionTimeout);
       console.log('WebSocket closed');
-      setWsStatus('disconnected');
       
-      // Trigger reconnection only if we have active game intent and didn't close deliberately
-      if (connectionDetailsRef.current) {
-        setErrorMsg('서버 실시간 연결 해제됨. 2.5초 후 재연결을 시도합니다...');
-        console.log('Reconnection triggered in 2.5 seconds...');
-        reconnectTimeoutRef.current = setTimeout(() => {
-          const det = connectionDetailsRef.current;
-          if (det) {
-            connectWebSocket(det.roomCode, det.isHost, det.nickName, wsUrl);
-          }
-        }, 2500);
+      // If we closed deliberately by exit, do not trigger reconnect or errors
+      if (!connectionDetailsRef.current) {
+        setWsStatus('disconnected');
+        return;
       }
+
+      setWsStatus('disconnected');
+      setErrorMsg('서버와 연결이 유실되었습니다. 예비 터널로 자동 우회/재연결합니다...');
+      
+      // Attempt reconnect with next URL in queue
+      reconnectTimeoutRef.current = setTimeout(() => {
+        wsAttemptIndexRef.current += 1;
+        connectWebSocket(code, isHost, name);
+      }, 1500);
     };
 
     socket.onerror = (err) => {
       clearTimeout(connectionTimeout);
-      console.error('WebSocket encountered an error:', err);
-      if (wsUrl !== CLOUD_RUN_WS_URL) {
-        console.log('Attempting instant fallback to central Cloud Run gateway...');
-        try { socket.close(); } catch (_) {}
-        connectWebSocket(code, isHost, name, CLOUD_RUN_WS_URL);
-      } else {
-        if (connectionDetailsRef.current) {
-          setErrorMsg('실시간 게임 서버 연결에 실패했습니다. 방 번호가 존재하지 않거나 클라우드 서버 부팅 중일 수 있습니다.');
-        }
-      }
+      console.error('WebSocket error event structure:', err);
+      // Let onclose handle the fallback & retry cycle
     };
+  };
+
+  // Separated socket failure router to safely go through tier list
+  const handleSocketFailure = (code: string, isHost: boolean, name: string, failedUrl: string, urlList: string[]) => {
+    wsAttemptIndexRef.current += 1;
+    const nextIdx = wsAttemptIndexRef.current % urlList.length;
+    const nextUrl = urlList[nextIdx];
+    
+    setErrorMsg(`[서버 접속 지연] 다음 대체 터널로 조인하는 중... (${wsAttemptIndexRef.current}차 시도)`);
+    console.log(`Routing connection to fallback index=${nextIdx} URL=${nextUrl}`);
+
+    // Wait 1.0 second before trying next server in queue to prevent tight spinning
+    reconnectTimeoutRef.current = setTimeout(() => {
+      connectWebSocket(code, isHost, name, nextUrl);
+    }, 1000);
   };
 
   // Safe action dispatch sender helper
@@ -466,6 +501,60 @@ export default function App() {
             </motion.div>
           )}
         </AnimatePresence>
+
+        {/* Real-time Connection Process UI Overlay */}
+        {wsStatus === 'connecting' && (
+          <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              className="bg-white rounded-3xl p-8 max-w-md w-full shadow-2xl border border-slate-100 text-center space-y-6"
+            >
+              <div className="relative w-20 h-20 mx-auto">
+                <div className="absolute inset-0 rounded-full border-4 border-indigo-100 animate-pulse" />
+                <div className="absolute inset-0 rounded-full border-4 border-transparent border-t-indigo-600 animate-spin" />
+                <div className="absolute inset-0 flex items-center justify-center text-3xl">
+                  🔌
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <h3 className="text-lg font-black text-slate-800">실시간 멀티플레이 게이트 연결 중</h3>
+                <p className="text-slate-500 text-xs leading-relaxed">
+                  멀티플레이 데이터 전송 터널을 개설하는 중입니다. <br />
+                  잠시만 기다려 주시면 안전하게 대기실로 자동 이동합니다!
+                </p>
+              </div>
+
+              <div className="bg-indigo-50 border border-indigo-100 rounded-xl p-4 text-[11px] text-indigo-950 font-bold leading-relaxed space-y-1">
+                <span className="block text-indigo-700 font-extrabold uppercase tracking-wider text-[10px] mb-1">
+                  CURRENT CONNECTION FLOW
+                </span>
+                <div className="text-slate-800 select-all font-mono break-all text-xs">
+                  {connectionMessage || '🔌 실시간 멀티플레이 터널 개설 중...'}
+                </div>
+              </div>
+
+              {errorMsg && (
+                <div className="bg-yellow-50 text-yellow-700 text-[11px] py-2 px-3 rounded-xl border border-yellow-200 flex items-center justify-center gap-1.5 font-medium animate-pulse">
+                  <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                  <span>{errorMsg}</span>
+                </div>
+              )}
+
+              <p className="text-[10px] text-slate-400 leading-normal">
+                💡 최초 접속 또는 Vercel 등의 외부 배포 환경에서 실행할 경우, 클라우드 서버 인스턴스 전원(Cold-Start)이 켜지는 동안 약 5~10초의 물리적 부팅 시간이 소요될 수 있습니다.
+              </p>
+
+              <button
+                onClick={handleExitRoom}
+                className="mt-2 text-[11px] text-red-500 hover:text-red-700 font-extrabold underline cursor-pointer hover:scale-105 transition-all text-center block mx-auto"
+              >
+                연결 취소하고 메인으로 돌아가기
+              </button>
+            </motion.div>
+          </div>
+        )}
       </main>
 
       {/* Footer System Credits */}
